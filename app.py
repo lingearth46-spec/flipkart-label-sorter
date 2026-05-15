@@ -12,6 +12,7 @@ Run:
     streamlit run app.py
 """
 
+import csv
 import io
 import json
 from collections import defaultdict
@@ -84,10 +85,31 @@ def save_pool_names(names: list[str]) -> None:
 # UI
 # ──────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Flipkart Label Sorter", layout="wide")
-st.title("Flipkart Label Sorter")
-st.caption("Upload one or more label PDFs — get one downloadable PDF per SKU "
-           "(or per custom pool of SKUs).")
+st.set_page_config(
+    page_title="Flipkart Label Sorter",
+    page_icon="📦",
+    layout="wide",
+)
+
+st.markdown("""
+<style>
+  .hero {
+    background: linear-gradient(135deg, #2874F0 0%, #1851A6 100%);
+    padding: 1.8rem 2rem;
+    border-radius: 14px;
+    color: white;
+    margin-bottom: 1.5rem;
+    box-shadow: 0 8px 24px rgba(40, 116, 240, 0.25);
+  }
+  .hero h1 { margin: 0; color: white; font-size: 2.1rem; font-weight: 700; }
+  .hero p  { margin: 0.4rem 0 0; color: rgba(255,255,255,0.92); font-size: 1rem; }
+  .stDownloadButton button[kind="primary"] { font-weight: 600; }
+</style>
+<div class="hero">
+  <h1>📦 Flipkart Label Sorter</h1>
+  <p>Upload one or more shipping label PDFs — get clean, SKU-sorted PDFs in seconds.</p>
+</div>
+""", unsafe_allow_html=True)
 
 uploaded_files = st.file_uploader(
     "Upload Flipkart label PDF(s)",
@@ -223,118 +245,175 @@ for r in final_entries:
     sku_to_entries[sku].append(r)
 
 # ──────────────────────────────────────────────────────────────
-# Per-SKU download buttons
+# Build a "fully sorted" PDF (all pages, grouped by SKU)
 # ──────────────────────────────────────────────────────────────
-st.divider()
-st.subheader("Download by SKU")
-
 sorted_skus = sorted(sku_to_entries.items(),
                      key=lambda kv: (-len(kv[1]), kv[0]))
 
 available_skus = [sku for sku, _ in sorted_skus if sku != "— UNKNOWN —"]
 
-for sku, entries in sorted_skus:
-    pages_preview = ", ".join(
-        f"{e['source']}#{e['src_page']}" for e in entries[:5]
-    )
-    if len(entries) > 5:
-        pages_preview += f", … (+{len(entries) - 5} more)"
+sorted_entries: list[dict] = []
+for _sku, _entries in sorted_skus:
+    sorted_entries.extend(_entries)
 
-    col1, col2, col3 = st.columns([4, 2, 2])
-    col1.markdown(f"**{sku}**  \n<small>{pages_preview}</small>",
-                  unsafe_allow_html=True)
-    col2.write(f"{len(entries)} label(s)")
+# Build CSV of the extraction table
+csv_buf = io.StringIO()
+csv_writer = csv.writer(csv_buf)
+csv_writer.writerow(["File", "Page", "AWB", "SKU", "Status"])
+for r in final_entries:
+    csv_writer.writerow([
+        r["source"], r["src_page"], r["awb"] or "",
+        r["sku"] or "", "WARN" if r["errors"] else "OK",
+    ])
+csv_data = csv_buf.getvalue().encode("utf-8")
 
-    pdf_bytes_out = build_pdf_from_entries(entries, source_bytes_map)
-    col3.download_button(
-        label="Download PDF",
-        data=pdf_bytes_out,
-        file_name=f"{safe_filename(sku)}_{len(entries)}labels.pdf",
+st.divider()
+st.subheader("📥 Quick exports")
+
+qcol1, qcol2 = st.columns(2)
+with qcol1:
+    sorted_pdf = build_pdf_from_entries(sorted_entries, source_bytes_map)
+    st.download_button(
+        label=f"⬇ Download everything sorted ({len(sorted_entries)} pages)",
+        data=sorted_pdf,
+        file_name="all_labels_sorted_by_sku.pdf",
         mime="application/pdf",
-        key=f"dl_{sku}",
+        type="primary",
         use_container_width=True,
+        help="One PDF with every page reordered so same-SKU labels are consecutive.",
+    )
+with qcol2:
+    st.download_button(
+        label=f"⬇ Download extraction table (CSV)",
+        data=csv_data,
+        file_name="extraction_table.csv",
+        mime="text/csv",
+        use_container_width=True,
+        help="Spreadsheet of every page with its file, AWB, SKU, and status.",
     )
 
 # ──────────────────────────────────────────────────────────────
-# SKU Pools (merge variants you know are the same product)
+# Per-SKU download buttons
 # ──────────────────────────────────────────────────────────────
 st.divider()
-st.subheader("SKU Pools")
-st.caption("Group multiple SKUs that are the same product. Pool names are "
-           "saved between sessions; pick which SKUs belong to each pool fresh "
-           "every upload.")
+st.subheader("Download by SKU")
 
-pool_names = load_pool_names()
+search_query = st.text_input(
+    "🔍 Filter SKUs",
+    placeholder="Type to filter (e.g. ZIG GOLD)",
+    label_visibility="collapsed",
+).strip().lower()
 
-# ── Create new pool ──
-with st.expander("➕ Create a new pool", expanded=not pool_names):
-    new_pool_name = st.text_input("Pool name",
-                                  placeholder="e.g. ZIG GOLD all variants",
-                                  key="new_pool_name")
-    if st.button("Create pool", key="create_pool_btn"):
-        name = (new_pool_name or "").strip()
-        if not name:
-            st.warning("Pool name cannot be empty.")
-        elif name in pool_names:
-            st.warning(f"Pool '{name}' already exists.")
-        else:
-            pool_names.append(name)
-            save_pool_names(pool_names)
-            st.success(f"Pool '{name}' created.")
-            st.rerun()
+filtered_skus = [
+    (sku, entries) for sku, entries in sorted_skus
+    if not search_query or search_query in sku.lower()
+]
 
-if not pool_names:
-    st.info("No saved pools yet. Create one above.")
+if not filtered_skus:
+    st.info(f"No SKUs match '{search_query}'.")
 else:
-    for pool_name in sorted(pool_names):
-        with st.container(border=True):
-            head_a, head_b, head_c = st.columns([5, 2, 1])
-            head_a.markdown(f"### {pool_name}")
+    if search_query:
+        st.caption(f"Showing {len(filtered_skus)} of {len(sorted_skus)} SKUs.")
 
-            # Rename
-            with head_b.popover("Rename"):
-                renamed = st.text_input("New name", value=pool_name,
-                                        key=f"rename_input_{pool_name}")
-                if st.button("Save", key=f"rename_save_{pool_name}"):
-                    new = renamed.strip()
-                    if new and new != pool_name and new not in pool_names:
-                        pool_names = [new if n == pool_name else n
-                                      for n in pool_names]
-                        save_pool_names(pool_names)
-                        st.rerun()
+    for sku, entries in filtered_skus:
+        pages_preview = ", ".join(
+            f"{e['source']}#{e['src_page']}" for e in entries[:5]
+        )
+        if len(entries) > 5:
+            pages_preview += f", … (+{len(entries) - 5} more)"
 
-            # Delete
-            if head_c.button("Delete", key=f"delete_{pool_name}"):
-                pool_names = [n for n in pool_names if n != pool_name]
+        col1, col2, col3 = st.columns([4, 2, 2])
+        col1.markdown(f"**{sku}**  \n<small>{pages_preview}</small>",
+                      unsafe_allow_html=True)
+        col2.write(f"{len(entries)} label(s)")
+
+        pdf_bytes_out = build_pdf_from_entries(entries, source_bytes_map)
+        col3.download_button(
+            label="⬇ Download",
+            data=pdf_bytes_out,
+            file_name=f"{safe_filename(sku)}_{len(entries)}labels.pdf",
+            mime="application/pdf",
+            key=f"dl_{sku}",
+            use_container_width=True,
+        )
+
+# ──────────────────────────────────────────────────────────────
+# SKU Pools — lives in the sidebar (hamburger menu)
+# ──────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### 📦 SKU Pools")
+    st.caption("Group multiple SKUs that are the same product. Pool names "
+               "are saved between sessions; SKUs are picked fresh every upload.")
+
+    pool_names = load_pool_names()
+
+    with st.expander("➕ Create a new pool", expanded=not pool_names):
+        new_pool_name = st.text_input(
+            "Pool name",
+            placeholder="e.g. ZIG GOLD all variants",
+            key="new_pool_name",
+        )
+        if st.button("Create pool", key="create_pool_btn",
+                     use_container_width=True):
+            name = (new_pool_name or "").strip()
+            if not name:
+                st.warning("Pool name cannot be empty.")
+            elif name in pool_names:
+                st.warning(f"Pool '{name}' already exists.")
+            else:
+                pool_names.append(name)
                 save_pool_names(pool_names)
                 st.rerun()
 
-            # SKU selector (fresh per session)
-            selected = st.multiselect(
-                "SKUs in this pool (pick from current upload):",
-                options=available_skus,
-                key=f"pool_skus_{pool_name}",
-            )
+    if not pool_names:
+        st.info("No saved pools yet.")
+    else:
+        st.divider()
+        for pool_name in sorted(pool_names):
+            with st.container(border=True):
+                head_a, head_b = st.columns([5, 1])
+                head_a.markdown(f"**{pool_name}**")
 
-            if selected:
-                pool_entries = []
-                for sku in selected:
-                    pool_entries.extend(sku_to_entries.get(sku, []))
+                if head_b.button("🗑", key=f"delete_{pool_name}",
+                                 help="Delete this pool"):
+                    pool_names = [n for n in pool_names if n != pool_name]
+                    save_pool_names(pool_names)
+                    st.rerun()
 
-                if pool_entries:
-                    pool_pdf = build_pdf_from_entries(pool_entries,
-                                                     source_bytes_map)
-                    st.download_button(
-                        label=f"Download '{pool_name}' "
-                              f"({len(pool_entries)} labels from "
-                              f"{len(selected)} SKU(s))",
-                        data=pool_pdf,
-                        file_name=f"{safe_filename(pool_name)}_"
-                                  f"{len(pool_entries)}labels.pdf",
-                        mime="application/pdf",
-                        key=f"pool_dl_{pool_name}",
-                        type="primary",
-                        use_container_width=True,
-                    )
-            else:
-                st.caption("Select one or more SKUs above to enable download.")
+                with st.popover("✏ Rename", use_container_width=True):
+                    renamed = st.text_input("New name", value=pool_name,
+                                            key=f"rename_input_{pool_name}")
+                    if st.button("Save", key=f"rename_save_{pool_name}"):
+                        new = renamed.strip()
+                        if new and new != pool_name and new not in pool_names:
+                            pool_names = [new if n == pool_name else n
+                                          for n in pool_names]
+                            save_pool_names(pool_names)
+                            st.rerun()
+
+                selected = st.multiselect(
+                    "SKUs in this pool",
+                    options=available_skus,
+                    key=f"pool_skus_{pool_name}",
+                    label_visibility="collapsed",
+                    placeholder="Pick SKUs for this pool…",
+                )
+
+                if selected:
+                    pool_entries = []
+                    for sku in selected:
+                        pool_entries.extend(sku_to_entries.get(sku, []))
+
+                    if pool_entries:
+                        pool_pdf = build_pdf_from_entries(pool_entries,
+                                                         source_bytes_map)
+                        st.download_button(
+                            label=f"⬇ Download ({len(pool_entries)} labels)",
+                            data=pool_pdf,
+                            file_name=f"{safe_filename(pool_name)}_"
+                                      f"{len(pool_entries)}labels.pdf",
+                            mime="application/pdf",
+                            key=f"pool_dl_{pool_name}",
+                            type="primary",
+                            use_container_width=True,
+                        )
