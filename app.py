@@ -51,20 +51,36 @@ def extract_pages_from_file(file_name: str, pdf_bytes: bytes,
     return results
 
 
-def build_pdf_from_entries(entries: list[dict],
-                           source_bytes_map: dict[str, bytes]) -> bytes:
-    """Build a PDF containing the pages referenced by the entries."""
-    # Cache PdfReader per source file to avoid re-parsing
-    readers: dict[str, PdfReader] = {}
+@st.cache_resource(show_spinner=False)
+def _get_reader(pdf_bytes: bytes) -> PdfReader:
+    """Cache the parsed PdfReader per file-bytes; reused across renders."""
+    return PdfReader(io.BytesIO(pdf_bytes))
+
+
+@st.cache_data(show_spinner=False)
+def _cached_build_pdf(
+    page_refs: tuple[tuple[str, int], ...],
+    upload_signature: tuple,            # part of cache key — invalidates on new upload
+    _source_map: dict[str, bytes],      # leading underscore → not part of cache key
+) -> bytes:
+    """Build a PDF from (source_name, page_num) refs. Cached by refs + upload."""
     writer = PdfWriter()
-    for e in entries:
-        src = e["source"]
+    readers: dict[str, PdfReader] = {}
+    for src, page_num in page_refs:
         if src not in readers:
-            readers[src] = PdfReader(io.BytesIO(source_bytes_map[src]))
-        writer.add_page(readers[src].pages[e["src_page"] - 1])
+            readers[src] = _get_reader(_source_map[src])
+        writer.add_page(readers[src].pages[page_num - 1])
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
+
+
+def build_pdf_from_entries(entries: list[dict],
+                           source_bytes_map: dict[str, bytes]) -> bytes:
+    """Thin wrapper that turns entries into hashable refs and hits the cache."""
+    refs = tuple((e["source"], e["src_page"]) for e in entries)
+    sig = st.session_state.get("upload_signature", ())
+    return _cached_build_pdf(refs, sig, source_bytes_map)
 
 
 def safe_filename(name: str) -> str:
