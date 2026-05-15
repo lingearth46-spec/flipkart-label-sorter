@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project artifacts
+extraction_output.txt
+full_extraction.txt
+*.pdf
+
+# Streamlit secrets (never commit)
+.streamlit/secrets.toml
+
+# Local pool data
+pools.json
+
+# Claude Code workspace metadata
+.claude/
