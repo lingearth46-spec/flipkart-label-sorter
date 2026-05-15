@@ -15,7 +15,10 @@ Run:
 import csv
 import io
 import json
+import threading
+import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import streamlit as st
@@ -32,19 +35,19 @@ POOLS_FILE = Path(__file__).parent / "pools.json"
 # ──────────────────────────────────────────────────────────────
 
 def extract_pages_from_file(file_name: str, pdf_bytes: bytes,
-                            progress, progress_msg) -> list[dict]:
-    """Extract every page; each entry knows its source file + page index."""
+                            counter: list, lock: threading.Lock) -> list[dict]:
+    """Extract every page from one PDF; bumps a shared counter as it goes.
+    Designed to run inside a worker thread."""
     results = []
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    total = len(reader.pages)
     for i, page in enumerate(reader.pages, start=1):
         text = page.extract_text() or ""
         fields = extract_page_fields(text)
         fields["source"] = file_name
         fields["src_page"] = i
         results.append(fields)
-        if i % 10 == 0 or i == total:
-            progress.progress(i / total, text=f"{progress_msg}: page {i}/{total}")
+        with lock:
+            counter[0] += 1
     return results
 
 
@@ -136,18 +139,50 @@ if st.session_state.get("upload_signature") != upload_signature:
     st.session_state["dupes_action"] = None  # "remove" or "keep"
 
 
-# ── Extraction (cached by file content) ──
+# ── Extraction (parallelized across files, cached by file content) ──
 @st.cache_data(show_spinner=False)
 def _cached_extract_all(files_data: tuple[tuple[str, bytes], ...]) -> list[dict]:
-    progress = st.progress(0.0, text="Reading…")
-    all_results = []
-    for fname, b in files_data:
-        msg = f"Reading {fname}"
-        all_results.extend(extract_pages_from_file(fname, b, progress, msg))
+    file_count = len(files_data)
+
+    # Pre-count total pages so we can show a real percentage
+    total_pages = 0
+    for _, b in files_data:
+        total_pages += len(PdfReader(io.BytesIO(b)).pages)
+
+    progress = st.progress(
+        0.0, text=f"Reading {total_pages} pages across {file_count} file(s)…"
+    )
+    counter = [0]
+    counter_lock = threading.Lock()
+    all_results: list[dict] = []
+
+    # One worker per file (capped to keep resource usage sane)
+    max_workers = min(file_count, 8)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [
+            ex.submit(extract_pages_from_file, fname, b, counter, counter_lock)
+            for fname, b in files_data
+        ]
+
+        # Poll progress while workers run
+        while not all(f.done() for f in futures):
+            with counter_lock:
+                done = counter[0]
+            pct = done / total_pages if total_pages else 1.0
+            progress.progress(
+                min(pct, 1.0),
+                text=f"Processed {done}/{total_pages} pages "
+                     f"({file_count} file(s) in parallel)…",
+            )
+            time.sleep(0.15)
+
+        for fut in futures:
+            all_results.extend(fut.result())
+
     progress.empty()
     return all_results
 
-with st.spinner("Extracting SKU + AWB from each page…"):
+with st.spinner(f"Extracting SKU + AWB from {len(uploaded_files)} file(s)…"):
     all_entries = _cached_extract_all(
         tuple((f.name, source_bytes_map[f.name]) for f in uploaded_files)
     )
@@ -247,10 +282,21 @@ for r in final_entries:
 # ──────────────────────────────────────────────────────────────
 # Build a "fully sorted" PDF (all pages, grouped by SKU)
 # ──────────────────────────────────────────────────────────────
-sorted_skus = sorted(sku_to_entries.items(),
-                     key=lambda kv: (-len(kv[1]), kv[0]))
+# Default order: most labels first, then alphabetical
+_default_order = [sku for sku, _ in sorted(
+    sku_to_entries.items(), key=lambda kv: (-len(kv[1]), kv[0])
+)]
 
-available_skus = [sku for sku, _ in sorted_skus if sku != "— UNKNOWN —"]
+# Persist a user-editable order in session state. Reset whenever the SKU set
+# changes (e.g. new upload, duplicates removed).
+prev_order = st.session_state.get("sku_order")
+if prev_order is None or set(prev_order) != set(_default_order):
+    st.session_state["sku_order"] = list(_default_order)
+
+sku_order: list[str] = st.session_state["sku_order"]
+sorted_skus = [(sku, sku_to_entries[sku]) for sku in sku_order]
+
+available_skus = [sku for sku in sku_order if sku != "— UNKNOWN —"]
 
 sorted_entries: list[dict] = []
 for _sku, _entries in sorted_skus:
@@ -296,7 +342,12 @@ with qcol2:
 # Per-SKU download buttons
 # ──────────────────────────────────────────────────────────────
 st.divider()
-st.subheader("Download by SKU")
+header_a, header_b = st.columns([4, 1])
+header_a.subheader("Download by SKU")
+if header_b.button("↺ Reset order", use_container_width=True,
+                   help="Restore the default order (most labels first)"):
+    st.session_state["sku_order"] = list(_default_order)
+    st.rerun()
 
 search_query = st.text_input(
     "🔍 Filter SKUs",
@@ -309,26 +360,46 @@ filtered_skus = [
     if not search_query or search_query in sku.lower()
 ]
 
+reorder_disabled = bool(search_query)
+if reorder_disabled:
+    st.caption("Clear the filter to use the ↑/↓ reorder buttons.")
+
 if not filtered_skus:
     st.info(f"No SKUs match '{search_query}'.")
 else:
     if search_query:
         st.caption(f"Showing {len(filtered_skus)} of {len(sorted_skus)} SKUs.")
 
-    for sku, entries in filtered_skus:
-        pages_preview = ", ".join(
-            f"{e['source']}#{e['src_page']}" for e in entries[:5]
-        )
-        if len(entries) > 5:
-            pages_preview += f", … (+{len(entries) - 5} more)"
+    for idx, (sku, entries) in enumerate(filtered_skus):
+        # Position of this SKU in the FULL order (not the filtered view)
+        order_idx = sku_order.index(sku)
+        is_first = order_idx == 0
+        is_last = order_idx == len(sku_order) - 1
 
-        col1, col2, col3 = st.columns([4, 2, 2])
-        col1.markdown(f"**{sku}**  \n<small>{pages_preview}</small>",
-                      unsafe_allow_html=True)
-        col2.write(f"{len(entries)} label(s)")
+        col_move, col_sku, col_count, col_dl = st.columns([1, 4, 1.5, 2.5])
+
+        with col_move:
+            up_col, down_col = st.columns(2)
+            if up_col.button("↑", key=f"up_{sku}",
+                             disabled=reorder_disabled or is_first,
+                             help="Move up"):
+                sku_order[order_idx], sku_order[order_idx - 1] = \
+                    sku_order[order_idx - 1], sku_order[order_idx]
+                st.session_state["sku_order"] = sku_order
+                st.rerun()
+            if down_col.button("↓", key=f"down_{sku}",
+                               disabled=reorder_disabled or is_last,
+                               help="Move down"):
+                sku_order[order_idx], sku_order[order_idx + 1] = \
+                    sku_order[order_idx + 1], sku_order[order_idx]
+                st.session_state["sku_order"] = sku_order
+                st.rerun()
+
+        col_sku.markdown(f"**{sku}**")
+        col_count.write(f"{len(entries)} label(s)")
 
         pdf_bytes_out = build_pdf_from_entries(entries, source_bytes_map)
-        col3.download_button(
+        col_dl.download_button(
             label="⬇ Download",
             data=pdf_bytes_out,
             file_name=f"{safe_filename(sku)}_{len(entries)}labels.pdf",
